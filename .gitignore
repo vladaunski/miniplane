@@ -29,5 +29,12 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+*.pem
+*.key
+*.crt
+certs/
+.env
+.env.*
