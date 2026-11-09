@@ -1,0 +1,11 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: miniplane
+      POSTGRES_PASSWORD: dev        # local dev only, never reused anywhere
+      POSTGRES_DB: miniplane
+    ports:
+      - "127.0.0.1:5433:5432"       # reachable from this machine only
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
