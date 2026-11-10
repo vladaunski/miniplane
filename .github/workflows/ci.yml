@@ -12,6 +12,20 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: miniplane
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: miniplane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U miniplane"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +36,13 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: apply schema
+        run: psql "postgres://miniplane:dev@localhost:5432/miniplane" -f deploy/schema.sql
+
       - name: test
         run: go test -race -count=1 ./...
+        env:
+          DATABASE_URL: postgres://miniplane:dev@localhost:5432/miniplane
 
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
