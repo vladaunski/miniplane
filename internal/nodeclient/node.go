@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,6 +14,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrPermanent marks a node rejection that retrying cannot fix, such as a stale
+// generation or a tenant mismatch. The worker gives up on these immediately.
+var ErrPermanent = errors.New("permanent node error")
 
 // Client talks to one node over HTTP.
 type Client struct {
@@ -59,10 +64,15 @@ func (c *Client) do(req *http.Request, okStatuses ...int) error {
 		return fmt.Errorf("node request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if !slices.Contains(okStatuses, resp.StatusCode) {
+	if slices.Contains(okStatuses, resp.StatusCode) {
+		return nil
+	}
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict:
+		return fmt.Errorf("node returned %s: %w", resp.Status, ErrPermanent)
+	default:
 		return fmt.Errorf("node returned %s", resp.Status)
 	}
-	return nil
 }
 
 // List returns the IDs of the VMs the node currently has.
