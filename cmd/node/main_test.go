@@ -8,10 +8,8 @@ import (
 )
 
 func TestNodeRefusesStaleCreateAfterDelete(t *testing.T) {
-	s := &server{vms: map[string]vm{}, seen: map[string]stamp{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /vms/{id}", s.put)
-	mux.HandleFunc("DELETE /vms/{id}", s.delete)
+	s := newServer()
+	mux := s.routes()
 	call := func(method, target, body string) int {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(method, target, strings.NewReader(body)))

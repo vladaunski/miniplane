@@ -28,6 +28,19 @@ type server struct {
 	seen map[string]stamp
 }
 
+func newServer() *server {
+	return &server{vms: map[string]vm{}, seen: map[string]stamp{}}
+}
+
+// routes wires the handlers; main and the tests share it so they cannot drift apart.
+func (s *server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /vms/{id}", s.put)
+	mux.HandleFunc("DELETE /vms/{id}", s.delete)
+	mux.HandleFunc("GET /vms", s.list)
+	return mux
+}
+
 // put handles PUT /vms/{id}. Idempotent, and refuses commands older than what it has seen.
 func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -105,15 +118,10 @@ func (s *server) list(w http.ResponseWriter, _ *http.Request) {
 }
 
 func main() {
-	s := &server{vms: map[string]vm{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /vms/{id}", s.put)
-	mux.HandleFunc("DELETE /vms/{id}", s.delete)
-	mux.HandleFunc("GET /vms", s.list)
-
+	s := newServer()
 	srv := &http.Server{
 		Addr:              "127.0.0.1:9001", // localhost only until the node authenticates callers
-		Handler:           mux,
+		Handler:           s.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Println("node listening on", srv.Addr)
