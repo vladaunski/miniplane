@@ -205,3 +205,85 @@ func TestStaleWorkerCannotComplete(t *testing.T) {
 		t.Fatalf("current Complete failed: %v", err)
 	}
 }
+
+func TestJobThatKeepsExpiringIsFailedNotReclaimed(t *testing.T) {
+	s, pool := testStore(t)
+	s.Lease = 100 * time.Millisecond
+	s.MaxAttempts = 1
+	ctx := context.Background()
+	if _, err := s.CreateVM(ctx, "acme", "vm1", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	// The worker "dies" while holding the last attempt it was allowed.
+	if _, err := s.ClaimNext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := s.ClaimNext(ctx); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("exhausted job was handed out again: %v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM operations`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("status = %q, want failed", status)
+	}
+	var phase string
+	if err := pool.QueryRow(ctx, `SELECT phase FROM vms`).Scan(&phase); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "FAILED" {
+		t.Fatalf("vm phase = %q, want FAILED", phase)
+	}
+}
+
+func TestExhaustedCreateMarksTheVMFailed(t *testing.T) {
+	s, pool := testStore(t)
+	ctx := context.Background()
+	op, err := s.CreateVM(ctx, "acme", "vm1", "k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With attempts left, the VM stays PENDING: a retry is coming.
+	if err := s.Fail(ctx, work, 2); err != nil {
+		t.Fatal(err)
+	}
+	vm, err := s.GetVM(ctx, "acme", op.VMID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.Phase != "PENDING" {
+		t.Fatalf("phase after a retryable failure = %q, want PENDING", vm.Phase)
+	}
+
+	// Out of attempts: the VM is FAILED.
+	if _, err := pool.Exec(ctx, `UPDATE operations SET run_after = now()`); err != nil {
+		t.Fatal(err)
+	}
+	work, err = s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Fail(ctx, work, 2); err != nil {
+		t.Fatal(err)
+	}
+	vm, err = s.GetVM(ctx, "acme", op.VMID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.Phase != "FAILED" {
+		t.Fatalf("phase after final failure = %q, want FAILED", vm.Phase)
+	}
+
+	// A failed VM can still be deleted by the user.
+	if _, err := s.DeleteVM(ctx, "acme", op.VMID, "k2"); err != nil {
+		t.Fatalf("delete of a failed vm: %v", err)
+	}
+}

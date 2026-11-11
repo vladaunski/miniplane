@@ -34,13 +34,16 @@ type Operation struct {
 
 // Store wraps the Postgres pool and holds all queries.
 type Store struct {
-	pool  *pgxpool.Pool
+	pool *pgxpool.Pool
+	// Lease is how long a claim lasts without a heartbeat.
 	Lease time.Duration
+	// MaxAttempts is how many times an operation may be claimed before it fails for good.
+	MaxAttempts int
 }
 
 // New returns a Store that uses the given connection pool.
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool, Lease: 30 * time.Second}
+	return &Store{pool: pool, Lease: 30 * time.Second, MaxAttempts: 5}
 }
 
 // CreateVM records the intent "this VM should exist" and returns an Operation.

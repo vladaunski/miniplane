@@ -13,13 +13,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vladaunski/miniplane/internal/domain"
 	"github.com/vladaunski/miniplane/internal/nodeclient"
 	"github.com/vladaunski/miniplane/internal/store"
-
-	"github.com/vladaunski/miniplane/internal/domain"
 )
-
-const maxAttempts = 5
 
 type worker struct {
 	store *store.Store
@@ -86,24 +83,33 @@ func (w *worker) processOne(ctx context.Context) bool {
 
 	var opErr error
 	switch work.Kind {
-	case "create":
+	case domain.OpCreate:
 		opErr = w.node.Create(jobCtx, work.VMID, work.TenantID, work.Generation)
-	case "delete":
+	case domain.OpDelete:
 		opErr = w.node.Delete(jobCtx, work.VMID, work.TenantID, work.Generation)
 	default:
-		opErr = fmt.Errorf("unknown operation kind %q", work.Kind)
+		opErr = fmt.Errorf("unknown operation kind %q: %w", work.Kind, nodeclient.ErrPermanent)
 	}
 	cancelJob()
 	<-hbDone
 
+	// Record the outcome even while shutting down: ctx is cancelled on SIGTERM,
+	// and a cancelled context would make these writes fail.
+	finishCtx, cancelFinish := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelFinish()
+
 	if opErr != nil {
 		log.Printf("operation %s (%s) failed: %v", work.OpID, work.Kind, opErr)
-		if err := w.store.Fail(ctx, work, maxAttempts); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+		limit := w.store.MaxAttempts
+		if errors.Is(opErr, nodeclient.ErrPermanent) {
+			limit = work.Attempt // retrying cannot help: Fail gives up immediately
+		}
+		if err := w.store.Fail(finishCtx, work, limit); err != nil && !errors.Is(err, store.ErrLeaseLost) {
 			log.Printf("mark failed: %v", err)
 		}
 		return true
 	}
-	if err := w.store.Complete(ctx, work); err != nil {
+	if err := w.store.Complete(finishCtx, work); err != nil {
 		if errors.Is(err, store.ErrLeaseLost) {
 			log.Printf("operation %s: lease lost, result discarded", work.OpID)
 			return true
@@ -151,12 +157,12 @@ func (w *worker) reconcileOnce(ctx context.Context) {
 	for _, vm := range vms {
 		id := string(vm.ID)
 		known[id] = true
-		var kind string
+		var kind domain.OpKind
 		switch domain.Drift(vm, onNode[id]) {
 		case domain.ActionCreate:
-			kind = "create"
+			kind = domain.OpCreate
 		case domain.ActionDelete:
-			kind = "delete"
+			kind = domain.OpDelete
 		default:
 			continue
 		}

@@ -25,18 +25,9 @@ type Work struct {
 	OpID       string
 	VMID       string
 	TenantID   string
-	Kind       string // "create" or "delete"
-	Attempt    int    // fencing token: which claim this worker holds
+	Kind       domain.OpKind
+	Attempt    int // fencing token: which claim this worker holds
 	Generation int64
-}
-
-// VM is a snapshot of the VM row, for the reconciler.
-type VM struct {
-	ID         string
-	Name       string
-	Desired    string
-	Generation int64
-	Phase      string
 }
 
 // isNotFound treats "no rows" and "malformed uuid" the same way: nothing to see here.
@@ -49,19 +40,21 @@ func isNotFound(err error) bool {
 }
 
 // GetVM returns a VM, but only if it belongs to the tenant.
-func (s *Store) GetVM(ctx context.Context, tenant domain.TenantID, id string) (VM, error) {
-	var v VM
+func (s *Store) GetVM(ctx context.Context, tenant domain.TenantID, id string) (domain.VM, error) {
+	var vmID, desired, phase string
+	v := domain.VM{TenantID: tenant}
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, name, desired, generation, phase
 		FROM vms WHERE id = $1::uuid AND tenant_id = $2`,
 		id, string(tenant),
-	).Scan(&v.ID, &v.Name, &v.Desired, &v.Generation, &v.Phase)
+	).Scan(&vmID, &v.Name, &desired, &v.Generation, &phase)
 	if isNotFound(err) {
-		return VM{}, ErrNotFound
+		return domain.VM{}, ErrNotFound
 	}
 	if err != nil {
-		return VM{}, fmt.Errorf("get vm: %w", err)
+		return domain.VM{}, fmt.Errorf("get vm: %w", err)
 	}
+	v.ID, v.Desired, v.Phase = domain.VMID(vmID), domain.Desired(desired), domain.Phase(phase)
 	return v, nil
 }
 
@@ -168,8 +161,24 @@ func (s *Store) GetOperation(ctx context.Context, tenant domain.TenantID, id str
 // ClaimNext atomically takes the oldest runnable pending operation and marks it running.
 // FOR UPDATE SKIP LOCKED means a row another worker is claiming right now is skipped,
 // not waited for, so concurrent workers each get a different job.
+//
+// A running job whose lease expired on its last allowed attempt is failed instead of
+// handed out again, so a job that crashes every worker that touches it cannot loop forever.
 func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
+	if _, err := s.pool.Exec(ctx, `
+		WITH dead AS (
+			UPDATE operations SET status = 'failed', lease_expires_at = NULL
+			WHERE status = 'running' AND lease_expires_at < now() AND attempts >= $1
+			RETURNING vm_id, kind
+		)
+		UPDATE vms SET phase = 'FAILED'
+		WHERE id IN (SELECT vm_id FROM dead WHERE kind = 'create')`,
+		s.MaxAttempts); err != nil {
+		return Work{}, fmt.Errorf("fail exhausted jobs: %w", err)
+	}
+
 	var w Work
+	var kind string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE operations
 		SET status = 'running',
@@ -185,13 +194,14 @@ func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 		)
 		RETURNING id::text, vm_id::text, tenant_id, kind, attempts, vm_generation`,
 		s.Lease.Seconds(),
-	).Scan(&w.OpID, &w.VMID, &w.TenantID, &w.Kind, &w.Attempt, &w.Generation)
+	).Scan(&w.OpID, &w.VMID, &w.TenantID, &kind, &w.Attempt, &w.Generation)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Work{}, ErrNoWork
 	}
 	if err != nil {
 		return Work{}, fmt.Errorf("claim: %w", err)
 	}
+	w.Kind = domain.OpKind(kind)
 	return w, nil
 }
 
@@ -202,7 +212,7 @@ var ErrLeaseLost = errors.New("lease lost")
 // but only for the worker holding the current token.
 func (s *Store) Complete(ctx context.Context, w Work) error {
 	phase := domain.PhaseRunning
-	if w.Kind == "delete" {
+	if w.Kind == domain.OpDelete {
 		phase = domain.PhaseDeleted
 	}
 
@@ -233,20 +243,40 @@ func (s *Store) Complete(ctx context.Context, w Work) error {
 }
 
 // Fail records a failed attempt. Below maxAttempts the job goes back to pending
-// with backoff; at maxAttempts it fails for good. A stale worker gets ErrLeaseLost.
+// with backoff; at maxAttempts it fails for good, and a VM whose create failed for good
+// is marked FAILED so clients do not see it as PENDING forever.
+// A stale worker gets ErrLeaseLost.
 func (s *Store) Fail(ctx context.Context, w Work, maxAttempts int) error {
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status string
+	err = tx.QueryRow(ctx, `
 		UPDATE operations SET
 			status = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END,
 			run_after = now() + interval '1 second' * power(2, attempts - 1) * (0.5 + random()),
 			lease_expires_at = NULL
-		WHERE id = $1::uuid AND attempts = $2 AND status = 'running'`,
-		w.OpID, w.Attempt, maxAttempts)
+		WHERE id = $1::uuid AND attempts = $2 AND status = 'running'
+		RETURNING status`,
+		w.OpID, w.Attempt, maxAttempts).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrLeaseLost
+	}
 	if err != nil {
 		return fmt.Errorf("record failure: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrLeaseLost
+
+	if status == "failed" && w.Kind == domain.OpCreate {
+		if _, err := tx.Exec(ctx,
+			`UPDATE vms SET phase = 'FAILED' WHERE id = $1::uuid`, w.VMID); err != nil {
+			return fmt.Errorf("mark vm failed: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
@@ -289,12 +319,12 @@ func (s *Store) ListVMs(ctx context.Context) ([]domain.VM, error) {
 	return out, rows.Err()
 }
 
-// Repair enqueues a corrective operation ("create" or "delete") for a VM that has
+// Repair enqueues a corrective operation (create or delete) for a VM that has
 // drifted from the node. It re-checks the VM's state inside the transaction, so a
 // repair based on a stale read does nothing. It returns false if nothing was enqueued.
-func (s *Store) Repair(ctx context.Context, vmID, kind string) (bool, error) {
+func (s *Store) Repair(ctx context.Context, vmID string, kind domain.OpKind) (bool, error) {
 	wantDesired, wantPhase := "present", "RUNNING"
-	if kind == "delete" {
+	if kind == domain.OpDelete {
 		wantDesired, wantPhase = "absent", "DELETED"
 	}
 
@@ -324,7 +354,7 @@ func (s *Store) Repair(ctx context.Context, vmID, kind string) (bool, error) {
 		INSERT INTO operations (tenant_id, vm_id, kind, vm_generation, idempotency_key, request_hash)
 		VALUES ($1, $2::uuid, $3, $4, 'repair-' || gen_random_uuid()::text, 'repair')
 		ON CONFLICT DO NOTHING
-		RETURNING id::text`, tenant, vmID, kind, gen).Scan(&opID)
+		RETURNING id::text`, tenant, vmID, string(kind), gen).Scan(&opID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -332,7 +362,7 @@ func (s *Store) Repair(ctx context.Context, vmID, kind string) (bool, error) {
 		return false, fmt.Errorf("insert repair operation: %w", err)
 	}
 
-	if kind == "create" {
+	if kind == domain.OpCreate {
 		if _, err := tx.Exec(ctx, `UPDATE vms SET phase = 'PENDING' WHERE id = $1::uuid`, vmID); err != nil {
 			return false, fmt.Errorf("reset phase: %w", err)
 		}

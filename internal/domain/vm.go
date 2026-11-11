@@ -27,6 +27,7 @@ const (
 	PhaseRunning      Phase = "RUNNING"
 	PhaseDeleting     Phase = "DELETING"
 	PhaseDeleted      Phase = "DELETED"
+	PhaseFailed       Phase = "FAILED"
 )
 
 // VM is one row of the source of truth. TenantID is mandatory:
