@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -33,12 +34,13 @@ type Operation struct {
 
 // Store wraps the Postgres pool and holds all queries.
 type Store struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	Lease time.Duration
 }
 
 // New returns a Store that uses the given connection pool.
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return &Store{pool: pool, Lease: 30 * time.Second}
 }
 
 // CreateVM records the intent "this VM should exist" and returns an Operation.

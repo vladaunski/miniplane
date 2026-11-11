@@ -20,6 +20,7 @@ CREATE TABLE operations (
     created_at      timestamptz NOT NULL DEFAULT now(),
     attempts        int         NOT NULL DEFAULT 0,
     run_after       timestamptz NOT NULL DEFAULT now(),
+    lease_expires_at timestamptz,
     UNIQUE (tenant_id, idempotency_key)
 );
 

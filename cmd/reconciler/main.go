@@ -37,6 +37,26 @@ func (w *worker) run(ctx context.Context) {
 	}
 }
 
+func (w *worker) heartbeat(ctx context.Context, opID string) {
+	t := time.NewTicker(w.store.Lease / 3)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			err := w.store.Heartbeat(ctx, opID)
+			if errors.Is(err, store.ErrLeaseLost) {
+				log.Printf("operation %s: lease lost", opID)
+				return
+			}
+			if err != nil && ctx.Err() == nil {
+				log.Printf("heartbeat %s: %v", opID, err)
+			}
+		}
+	}
+}
+
 // processOne handles one operation and reports whether there might be more.
 func (w *worker) processOne(ctx context.Context) bool {
 	work, err := w.store.ClaimNext(ctx)
@@ -50,6 +70,13 @@ func (w *worker) processOne(ctx context.Context) bool {
 		return false
 	}
 
+	hbCtx, stopHB := context.WithCancel(ctx)
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		w.heartbeat(hbCtx, work.OpID)
+	}()
+
 	var opErr error
 	switch work.Kind {
 	case "create":
@@ -59,6 +86,9 @@ func (w *worker) processOne(ctx context.Context) bool {
 	default:
 		opErr = fmt.Errorf("unknown operation kind %q", work.Kind)
 	}
+
+	stopHB()
+	<-hbDone
 
 	if opErr != nil {
 		log.Printf("operation %s (%s) failed: %v", work.OpID, work.Kind, opErr)

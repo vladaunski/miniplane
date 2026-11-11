@@ -143,15 +143,19 @@ func (s *Store) GetOperation(ctx context.Context, tenant domain.TenantID, id str
 func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 	var w Work
 	err := s.pool.QueryRow(ctx, `
-		UPDATE operations SET status = 'running'
+		UPDATE operations
+		SET status = 'running',
+		    lease_expires_at = now() + make_interval(secs => $1::float8)
 		WHERE id = (
 			SELECT id FROM operations
-			WHERE status = 'pending' AND run_after <= now()
+			WHERE (status = 'pending' AND run_after <= now())
+			   OR (status = 'running' AND lease_expires_at < now())
 			ORDER BY created_at
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id::text, vm_id::text, tenant_id, kind`,
+		s.Lease.Seconds(),
 	).Scan(&w.OpID, &w.VMID, &w.TenantID, &w.Kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Work{}, ErrNoWork
@@ -161,6 +165,9 @@ func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 	}
 	return w, nil
 }
+
+// ErrLeaseLost means the operation is no longer running under this lease.
+var ErrLeaseLost = errors.New("lease lost")
 
 // Complete marks the operation done and moves the VM to its new phase, atomically.
 func (s *Store) Complete(ctx context.Context, w Work) error {
@@ -200,6 +207,22 @@ func (s *Store) Fail(ctx context.Context, opID string, maxAttempts int) error {
 		WHERE id = $1::uuid`, opID, maxAttempts)
 	if err != nil {
 		return fmt.Errorf("record failure: %w", err)
+	}
+	return nil
+}
+
+// Heartbeat pushes the lease deadline forward while a worker is still working.
+func (s *Store) Heartbeat(ctx context.Context, opID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE operations
+		SET lease_expires_at = now() + make_interval(secs => $2::float8)
+		WHERE id = $1::uuid AND status = 'running'`,
+		opID, s.Lease.Seconds())
+	if err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -132,5 +133,51 @@ func TestFailRetriesWithBackoffThenGivesUp(t *testing.T) {
 	}
 	if status != "failed" {
 		t.Fatalf("status = %q after max attempts, want failed", status)
+	}
+}
+
+func TestAbandonedJobIsReclaimedAfterLeaseExpires(t *testing.T) {
+	s, _ := testStore(t)
+	s.Lease = 200 * time.Millisecond
+	ctx := context.Background()
+	if _, err := s.CreateVM(ctx, "acme", "vm1", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.ClaimNext(ctx) // this worker "dies" without finishing
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNext(ctx); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("job claimed during a valid lease: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	second, err := s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatalf("abandoned job was not reclaimed: %v", err)
+	}
+	if second.OpID != first.OpID {
+		t.Fatalf("reclaimed %s, want %s", second.OpID, first.OpID)
+	}
+}
+
+func TestHeartbeatKeepsTheLease(t *testing.T) {
+	s, _ := testStore(t)
+	s.Lease = 300 * time.Millisecond
+	ctx := context.Background()
+	if _, err := s.CreateVM(ctx, "acme", "vm1", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	work, err := s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if err := s.Heartbeat(ctx, work.OpID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.ClaimNext(ctx); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("job stolen from a live worker: %v", err)
 	}
 }
