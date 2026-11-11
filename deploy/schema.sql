@@ -30,3 +30,6 @@ CREATE UNIQUE INDEX vm_name_unique_live ON vms (tenant_id, name) WHERE phase <> 
 -- At most one in-flight operation per VM, enforced by the database itself.
 CREATE UNIQUE INDEX one_active_op_per_vm
     ON operations (vm_id) WHERE status IN ('pending','running');
+
+-- Keeps the claim query fast: only unfinished operations are ever claimed.
+CREATE INDEX operations_claimable ON operations (created_at) WHERE status IN ('pending','running');
