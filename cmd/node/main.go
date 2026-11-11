@@ -5,9 +5,17 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// stamp is the node's memory of a VM ID: the highest generation seen and its owner.
+// It outlives the VM itself (a tombstone), so late commands for a deleted VM are refused.
+type stamp struct {
+	gen    int64
+	tenant string
+}
 
 type vm struct {
 	ID       string `json:"id"`
@@ -15,29 +23,39 @@ type vm struct {
 }
 
 type server struct {
-	mu  sync.Mutex // guards vms; handlers run concurrently
-	vms map[string]vm
+	mu   sync.Mutex
+	vms  map[string]vm
+	seen map[string]stamp
 }
 
-// put handles PUT /vms/{id}. Idempotent: creating an existing VM of the same tenant succeeds again.
+// put handles PUT /vms/{id}. Idempotent, and refuses commands older than what it has seen.
 func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
 	var req struct {
-		TenantID string `json:"tenant_id"`
+		TenantID   string `json:"tenant_id"`
+		Generation int64  `json:"generation"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TenantID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TenantID == "" || req.Generation < 1 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.vms[id]; ok {
-		if existing.TenantID != req.TenantID {
+	if st, ok := s.seen[id]; ok {
+		if st.tenant != req.TenantID {
 			http.Error(w, "conflict", http.StatusConflict)
 			return
 		}
+		if req.Generation < st.gen {
+			http.Error(w, "stale generation", http.StatusConflict)
+			return
+		}
+	}
+	s.seen[id] = stamp{gen: max(req.Generation, s.seen[id].gen), tenant: req.TenantID}
+
+	if _, ok := s.vms[id]; ok {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -45,24 +63,30 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-// delete handles DELETE /vms/{id}?tenant_id=... Idempotent: a missing VM still succeeds.
+// delete handles DELETE /vms/{id}?tenant_id=...&generation=... Idempotent, and records a tombstone.
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	tenant := r.URL.Query().Get("tenant_id")
-	if tenant == "" {
+	gen, err := strconv.ParseInt(r.URL.Query().Get("generation"), 10, 64)
+	if tenant == "" || err != nil || gen < 1 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.vms[id]; ok {
-		if existing.TenantID != tenant {
+	if st, ok := s.seen[id]; ok {
+		if st.tenant != tenant {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		delete(s.vms, id)
+		if gen < st.gen {
+			http.Error(w, "stale generation", http.StatusConflict)
+			return
+		}
 	}
+	s.seen[id] = stamp{gen: max(gen, s.seen[id].gen), tenant: tenant}
+	delete(s.vms, id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
