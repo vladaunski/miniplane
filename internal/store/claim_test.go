@@ -109,7 +109,7 @@ func TestFailRetriesWithBackoffThenGivesUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Fail(ctx, work.OpID, 2); err != nil {
+	if err := s.Fail(ctx, work, 2); err != nil {
 		t.Fatal(err)
 	}
 	// First failure: back to pending, but not runnable yet (backoff).
@@ -124,7 +124,7 @@ func TestFailRetriesWithBackoffThenGivesUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Fail(ctx, work.OpID, 2); err != nil {
+	if err := s.Fail(ctx, work, 2); err != nil {
 		t.Fatal(err)
 	}
 	var status string
@@ -173,11 +173,35 @@ func TestHeartbeatKeepsTheLease(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if err := s.Heartbeat(ctx, work.OpID); err != nil {
+		if err := s.Heartbeat(ctx, work); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if _, err := s.ClaimNext(ctx); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("job stolen from a live worker: %v", err)
+	}
+}
+
+func TestStaleWorkerCannotComplete(t *testing.T) {
+	s, _ := testStore(t)
+	s.Lease = 100 * time.Millisecond
+	ctx := context.Background()
+	if _, err := s.CreateVM(ctx, "acme", "vm1", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // A's lease lapses
+	b, err := s.ClaimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(ctx, a); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale Complete = %v, want ErrLeaseLost", err)
+	}
+	if err := s.Complete(ctx, b); err != nil {
+		t.Fatalf("current Complete failed: %v", err)
 	}
 }

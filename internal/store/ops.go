@@ -22,10 +22,21 @@ var (
 
 // Work is what the worker needs to carry out one operation.
 type Work struct {
-	OpID     string
-	VMID     string
-	TenantID string
-	Kind     string // "create" or "delete"
+	OpID       string
+	VMID       string
+	TenantID   string
+	Kind       string // "create" or "delete"
+	Attempt    int    // fencing token: which claim this worker holds
+	Generation int64
+}
+
+// VM is a snapshot of the VM row, for the reconciler.
+type VM struct {
+	ID         string
+	Name       string
+	Desired    string
+	Generation int64
+	Phase      string
 }
 
 // isNotFound treats "no rows" and "malformed uuid" the same way: nothing to see here.
@@ -35,6 +46,23 @@ func isNotFound(err error) bool {
 	}
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02" // invalid_text_representation
+}
+
+// GetVM returns a VM, but only if it belongs to the tenant.
+func (s *Store) GetVM(ctx context.Context, tenant domain.TenantID, id string) (VM, error) {
+	var v VM
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text, name, desired, generation, phase
+		FROM vms WHERE id = $1::uuid AND tenant_id = $2`,
+		id, string(tenant),
+	).Scan(&v.ID, &v.Name, &v.Desired, &v.Generation, &v.Phase)
+	if isNotFound(err) {
+		return VM{}, ErrNotFound
+	}
+	if err != nil {
+		return VM{}, fmt.Errorf("get vm: %w", err)
+	}
+	return v, nil
 }
 
 // DeleteVM records the intent "this VM should not exist" and returns an Operation.
@@ -145,6 +173,7 @@ func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 	err := s.pool.QueryRow(ctx, `
 		UPDATE operations
 		SET status = 'running',
+		    attempts = attempts + 1,
 		    lease_expires_at = now() + make_interval(secs => $1::float8)
 		WHERE id = (
 			SELECT id FROM operations
@@ -154,9 +183,9 @@ func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id::text, vm_id::text, tenant_id, kind`,
+		RETURNING id::text, vm_id::text, tenant_id, kind, attempts, vm_generation`,
 		s.Lease.Seconds(),
-	).Scan(&w.OpID, &w.VMID, &w.TenantID, &w.Kind)
+	).Scan(&w.OpID, &w.VMID, &w.TenantID, &w.Kind, &w.Attempt, &w.Generation)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Work{}, ErrNoWork
 	}
@@ -169,7 +198,8 @@ func (s *Store) ClaimNext(ctx context.Context) (Work, error) {
 // ErrLeaseLost means the operation is no longer running under this lease.
 var ErrLeaseLost = errors.New("lease lost")
 
-// Complete marks the operation done and moves the VM to its new phase, atomically.
+// Complete marks the operation done and updates the VM phase atomically,
+// but only for the worker holding the current token.
 func (s *Store) Complete(ctx context.Context, w Work) error {
 	phase := domain.PhaseRunning
 	if w.Kind == "delete" {
@@ -182,9 +212,15 @@ func (s *Store) Complete(ctx context.Context, w Work) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE operations SET status = 'done' WHERE id = $1::uuid`, w.OpID); err != nil {
+	tag, err := tx.Exec(ctx, `
+		UPDATE operations SET status = 'done', lease_expires_at = NULL
+		WHERE id = $1::uuid AND attempts = $2 AND status = 'running'`,
+		w.OpID, w.Attempt)
+	if err != nil {
 		return fmt.Errorf("mark done: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost // someone else owns this job now: discard our result
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE vms SET phase = $1 WHERE id = $2::uuid`, string(phase), w.VMID); err != nil {
@@ -196,28 +232,32 @@ func (s *Store) Complete(ctx context.Context, w Work) error {
 	return nil
 }
 
-// Fail records a failed attempt. Below maxAttempts the operation goes back to pending;
-// at maxAttempts it fails for good.
-func (s *Store) Fail(ctx context.Context, opID string, maxAttempts int) error {
-	_, err := s.pool.Exec(ctx, `
+// Fail records a failed attempt. Below maxAttempts the job goes back to pending
+// with backoff; at maxAttempts it fails for good. A stale worker gets ErrLeaseLost.
+func (s *Store) Fail(ctx context.Context, w Work, maxAttempts int) error {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE operations SET
-			attempts  = attempts + 1,
-			status    = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
-			run_after = now() + interval '1 second' * power(2, attempts) * (0.5 + random())
-		WHERE id = $1::uuid`, opID, maxAttempts)
+			status = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END,
+			run_after = now() + interval '1 second' * power(2, attempts - 1) * (0.5 + random()),
+			lease_expires_at = NULL
+		WHERE id = $1::uuid AND attempts = $2 AND status = 'running'`,
+		w.OpID, w.Attempt, maxAttempts)
 	if err != nil {
 		return fmt.Errorf("record failure: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
 	}
 	return nil
 }
 
-// Heartbeat pushes the lease deadline forward while a worker is still working.
-func (s *Store) Heartbeat(ctx context.Context, opID string) error {
+// Heartbeat extends the lease, but only for the worker holding the current token.
+func (s *Store) Heartbeat(ctx context.Context, w Work) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE operations
-		SET lease_expires_at = now() + make_interval(secs => $2::float8)
-		WHERE id = $1::uuid AND status = 'running'`,
-		opID, s.Lease.Seconds())
+		SET lease_expires_at = now() + make_interval(secs => $3::float8)
+		WHERE id = $1::uuid AND attempts = $2 AND status = 'running'`,
+		w.OpID, w.Attempt, s.Lease.Seconds())
 	if err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}
@@ -225,4 +265,80 @@ func (s *Store) Heartbeat(ctx context.Context, opID string) error {
 		return ErrLeaseLost
 	}
 	return nil
+}
+
+// ListVMs returns every VM, for the reconciler.
+func (s *Store) ListVMs(ctx context.Context) ([]domain.VM, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text, tenant_id, name, desired, generation, phase FROM vms`)
+	if err != nil {
+		return nil, fmt.Errorf("list vms: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.VM
+	for rows.Next() {
+		var id, tenant, name, desired, phase string
+		var gen int64
+		if err := rows.Scan(&id, &tenant, &name, &desired, &gen, &phase); err != nil {
+			return nil, fmt.Errorf("scan vm: %w", err)
+		}
+		out = append(out, domain.VM{
+			ID: domain.VMID(id), TenantID: domain.TenantID(tenant), Name: name,
+			Desired: domain.Desired(desired), Generation: gen, Phase: domain.Phase(phase),
+		})
+	}
+	return out, rows.Err()
+}
+
+// Repair enqueues a corrective operation ("create" or "delete") for a VM that has
+// drifted from the node. It re-checks the VM's state inside the transaction, so a
+// repair based on a stale read does nothing. It returns false if nothing was enqueued.
+func (s *Store) Repair(ctx context.Context, vmID, kind string) (bool, error) {
+	wantDesired, wantPhase := "present", "RUNNING"
+	if kind == "delete" {
+		wantDesired, wantPhase = "absent", "DELETED"
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var tenant string
+	var gen int64
+	err = tx.QueryRow(ctx, `
+		SELECT tenant_id, generation FROM vms
+		WHERE id = $1::uuid AND desired = $2 AND phase = $3
+		FOR UPDATE`, vmID, wantDesired, wantPhase).Scan(&tenant, &gen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // the VM changed since the reconciler looked
+	}
+	if err != nil {
+		return false, fmt.Errorf("select vm: %w", err)
+	}
+
+	// ON CONFLICT DO NOTHING: if an operation is already in flight, the partial
+	// unique index rejects ours and we simply do nothing.
+	var opID string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO operations (tenant_id, vm_id, kind, vm_generation, idempotency_key, request_hash)
+		VALUES ($1, $2::uuid, $3, $4, 'repair-' || gen_random_uuid()::text, 'repair')
+		ON CONFLICT DO NOTHING
+		RETURNING id::text`, tenant, vmID, kind, gen).Scan(&opID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("insert repair operation: %w", err)
+	}
+
+	if kind == "create" {
+		if _, err := tx.Exec(ctx, `UPDATE vms SET phase = 'PENDING' WHERE id = $1::uuid`, vmID); err != nil {
+			return false, fmt.Errorf("reset phase: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
 }

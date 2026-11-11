@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,8 +29,8 @@ func New(base string) *Client {
 }
 
 // Create asks the node to ensure the VM exists. Safe to repeat: the node is idempotent.
-func (c *Client) Create(ctx context.Context, vmID, tenant string) error {
-	body, err := json.Marshal(map[string]string{"tenant_id": tenant})
+func (c *Client) Create(ctx context.Context, vmID, tenant string, gen int64) error {
+	body, err := json.Marshal(map[string]any{"tenant_id": tenant, "generation": gen})
 	if err != nil {
 		return fmt.Errorf("encode body: %w", err)
 	}
@@ -42,9 +43,10 @@ func (c *Client) Create(ctx context.Context, vmID, tenant string) error {
 }
 
 // Delete asks the node to ensure the VM is gone. Safe to repeat.
-func (c *Client) Delete(ctx context.Context, vmID, tenant string) error {
+func (c *Client) Delete(ctx context.Context, vmID, tenant string, gen int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
-		c.base+"/vms/"+url.PathEscape(vmID)+"?tenant_id="+url.QueryEscape(tenant), nil)
+		c.base+"/vms/"+url.PathEscape(vmID)+"?tenant_id="+url.QueryEscape(tenant)+
+			"&generation="+strconv.FormatInt(gen, 10), nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -61,4 +63,31 @@ func (c *Client) do(req *http.Request, okStatuses ...int) error {
 		return fmt.Errorf("node returned %s", resp.Status)
 	}
 	return nil
+}
+
+// List returns the IDs of the VMs the node currently has.
+func (c *Client) List(ctx context.Context) (map[string]bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/vms", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("node request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("node returned %s", resp.Status)
+	}
+	var vms []struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&vms); err != nil {
+		return nil, fmt.Errorf("decode node list: %w", err)
+	}
+	out := make(map[string]bool, len(vms))
+	for _, v := range vms {
+		out[v.ID] = true
+	}
+	return out, nil
 }

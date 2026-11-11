@@ -102,6 +102,22 @@ func (a *api) getOperation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(op))
 }
 
+func (a *api) getVM(w http.ResponseWriter, r *http.Request) {
+	tenant, _, ok := identity(w, r, false)
+	if !ok {
+		return
+	}
+	v, err := a.store.GetVM(r.Context(), tenant, r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": v.ID, "name": v.Name, "desired": v.Desired,
+		"generation": v.Generation, "phase": v.Phase,
+	})
+}
+
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNameTaken), errors.Is(err, store.ErrOperationInFlight):
@@ -153,6 +169,7 @@ func main() {
 	mux.HandleFunc("POST /vms", a.createVM)
 	mux.HandleFunc("DELETE /vms/{id}", a.deleteVM)
 	mux.HandleFunc("GET /operations/{id}", a.getOperation)
+	mux.HandleFunc("GET /vms/{id}", a.getVM)
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
