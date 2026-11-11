@@ -25,3 +25,15 @@ func NextAction(vm VM) Action {
 		return ActionNone
 	}
 }
+
+// Drift compares what the database says with what the node reports and returns the repair needed.
+func Drift(vm VM, onNode bool) Action {
+	switch {
+	case vm.Desired == DesiredPresent && vm.Phase == PhaseRunning && !onNode:
+		return ActionCreate
+	case vm.Desired == DesiredAbsent && vm.Phase == PhaseDeleted && onNode:
+		return ActionDelete
+	default:
+		return ActionNone
+	}
+}
